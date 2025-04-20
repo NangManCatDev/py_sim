@@ -1,46 +1,53 @@
+# 개선된 시뮬레이션 코드 (PDF 요구사항 완전 반영 + GUI 최적화 및 다중 행위자 처리)
 from typing import List, Dict, Optional
 import random
 import math
 import time
 import gradio as gr
+import matplotlib.pyplot as plt
+import io
+import base64
 
 
 class Actor:
     def __init__(self, id: str, properties: Dict[str, float]):
         self.id = id
-        self.properties = properties  # 행위자의 속성들
-        self.actions = []  # 행위자의 행위들
-        self.space = None  # 소속된 공간
-        self.work = None  # 수행하는 일
+        self.properties = properties
+        self.actions = []
+        self.space = None
+        self.work = None
 
     def perform_action(self, action_type: str, target: Optional["Actor"] = None):
-        """행위자의 행위를 수행하는 메서드"""
         self.actions.append(action_type)
         if target:
             self._affect_target(target)
 
     def _affect_target(self, target: "Actor"):
-        """다른 행위자의 속성에 영향을 주는 메서드"""
-        # 구현은 구체적인 요구사항에 따라 달라질 수 있음
-        pass
+        if "negotiate" in self.actions:
+            target.properties["stress"] = target.properties.get("stress", 0) + 5
 
 
 class Environment:
     def __init__(self, id: str, properties: Dict[str, float]):
         self.id = id
-        self.properties = properties  # 환경의 속성들
-        self.manifestations = []  # 환경의 발현들
+        self.properties = properties
+        self.manifestations = []
 
     def manifest(self, manifestation_type: str, target: Optional["Environment"] = None):
-        """환경의 발현을 수행하는 메서드"""
         self.manifestations.append(manifestation_type)
+        if manifestation_type == "competition_rise":
+            self.properties["competition"] += 0.1
         if target:
             self._affect_environment(target)
 
     def _affect_environment(self, target: "Environment"):
-        """다른 환경의 속성에 영향을 주는 메서드"""
-        # 구현은 구체적인 요구사항에 따라 달라질 수 있음
-        pass
+        if "competition_rise" in self.manifestations:
+            target.properties["demand"] *= 0.95
+
+    def affect_actor(self, actor: Actor):
+        comp = self.properties.get("competition", 0)
+        if comp > 0.7:
+            actor.properties["stress"] = actor.properties.get("stress", 0) + comp * 10
 
 
 class Worker(Actor):
@@ -52,6 +59,8 @@ class Worker(Actor):
                 "distance": distance,
                 "previous_wage": previous_wage,
                 "employed": False,
+                "stress": 0,
+                "efficiency": 1.0,
             },
         )
         self.negotiation_attempts = 0
@@ -59,25 +68,20 @@ class Worker(Actor):
         self.deduction_rate = 0.05
 
     def negotiate_wage(self, population: int) -> float:
-        """임금 협상을 시도하는 메서드"""
         if self.negotiation_attempts >= self.max_attempts:
             return 0
 
-        base_wage = self.properties["previous_wage"] * (
-            1 + random.normalvariate(0, 0.1)
-        )
-        distance_factor = self.properties["distance"] * 1000  # km당 1000원 추가
+        base = self.properties["previous_wage"]
+        distance_factor = self.properties["distance"] * 1000
         age_factor = self._calculate_age_factor()
         population_factor = math.log(population + 1) * 1000
 
-        wage = base_wage + distance_factor + age_factor + population_factor
+        wage = base + distance_factor + age_factor + population_factor
         wage *= 1 - self.deduction_rate * self.negotiation_attempts
-
         self.negotiation_attempts += 1
         return wage
 
     def _calculate_age_factor(self) -> float:
-        """연령에 따른 임금 조정 계수를 계산하는 메서드"""
         age = self.properties["age"]
         if age < 30:
             return (age - 30) * 1000
@@ -92,18 +96,16 @@ class Employer(Actor):
         self.workers: List[Worker] = []
 
     def calculate_optimal_employment(self, wage: float) -> int:
-        """최적의 고용자 수를 계산하는 메서드"""
-        # 생산량과 고용자 수의 관계를 고려한 최적화
-        # 이는 실제 구현에서 더 복잡한 계산이 필요할 수 있음
-        base_production = self.properties["property_size"] * 100
-        optimal_workers = int(base_production / (wage * 0.1))
-        return max(1, optimal_workers)
+        base_production = self.properties["property_size"] * 1_000_000
+        labor_cost_ratio = 0.4
+        return max(1, int(base_production * labor_cost_ratio / wage))
 
     def calculate_profit(self, wage: float, num_workers: int) -> float:
-        """이익을 계산하는 메서드"""
-        production = self.properties["property_size"] * num_workers * 100
-        costs = wage * num_workers
-        return production - costs
+        comp = self.space.environments[0].properties["competition"]
+        prod_per_worker = 3_500_000 * (1 + comp)
+        production = prod_per_worker * num_workers
+        cost = wage * num_workers + production * 0.1
+        return production - cost
 
 
 class World:
@@ -114,53 +116,86 @@ class World:
 
     def add_actor(self, actor: Actor):
         self.actors.append(actor)
+        actor.space = self
 
     def add_environment(self, environment: Environment):
         self.environments.append(environment)
 
     def update(self):
-        """시스템의 상태를 업데이트하는 메서드"""
-        # 각 행위자와 환경의 상태를 업데이트
+        for env in self.environments:
+            for actor in self.actors:
+                env.affect_actor(actor)
+
         for actor in self.actors:
-            if isinstance(actor, Worker):
-                if not actor.properties["employed"]:
-                    wage = actor.negotiate_wage(self.population)
-                    # 고용주와의 협상 로직 구현 필요
+            if "stress" in actor.properties and "efficiency" in actor.properties:
+                stress = actor.properties["stress"]
+                actor.properties["efficiency"] = max(0.5, 1.0 - 0.01 * stress)
 
 
 def run_simulation(
-    market_competition: float, initial_wage: float, sim_count: int
+    market_competition: float,
+    initial_wage: float,
+    sim_count: int,
+    initial_population: int,
+    worker_count: int,
 ) -> str:
-    results = []
-    results.append("시뮬레이션 환경 초기화 중...\n")
+    results = ["시뮬레이션 환경 초기화 중...\n"]
 
     try:
+        world = World()
+        world.population = initial_population
+
+        env1 = Environment(
+            "market", {"demand": 1000, "supply": 800, "competition": market_competition}
+        )
+        env2 = Environment(
+            "secondary", {"demand": 900, "supply": 850, "competition": 0.3}
+        )
+        world.add_environment(env1)
+        world.add_environment(env2)
+
         for i in range(sim_count):
-            world = World()
-            environment = Environment(
-                "market",
-                {"demand": 1000, "supply": 800, "competition": market_competition},
-            )
-            world.add_environment(environment)
-
-            worker = Worker("worker1", 25, 5.0, initial_wage)
-            employer = Employer("employer1", 1000)
-
-            world.add_actor(worker)
-            world.add_actor(employer)
-
             results.append(f"\n시뮬레이션 {i+1} 시작:\n")
 
-            wage = worker.negotiate_wage(1000)
-            results.append(f"협상 임금: {wage:,.0f}원\n")
+            workers = [
+                Worker(
+                    f"worker{j+1}",
+                    age=20 + j,
+                    distance=1.0 + j,
+                    previous_wage=initial_wage,
+                )
+                for j in range(worker_count)
+            ]
+            employer = Employer("employer1", property_size=1000)
+            world.add_actor(employer)
+            for worker in workers:
+                world.add_actor(worker)
 
-            optimal_workers = employer.calculate_optimal_employment(wage)
-            results.append(f"최적 고용자 수: {optimal_workers}명\n")
+            env1.manifest("competition_rise", target=env2)
 
-            profit = employer.calculate_profit(wage, optimal_workers)
-            results.append(f"예상 이익: {profit:,.0f}원\n")
+            for worker in workers:
+                for attempt in range(worker.max_attempts):
+                    wage = worker.negotiate_wage(world.population)
+                    optimal_workers = employer.calculate_optimal_employment(wage)
+                    profit = employer.calculate_profit(wage, optimal_workers)
 
-            time.sleep(0.5)
+                    results.append(f"{worker.id} 협상 시도 {attempt + 1}:\n")
+                    results.append(f"- 제시 임금: {wage:,.0f}원\n")
+                    results.append(f"- 최적 고용자 수: {optimal_workers}명\n")
+                    results.append(f"- 예상 이익: {profit:,.0f}원\n")
+
+                    if profit > 0:
+                        employer.perform_action("negotiate", worker)
+                        worker.properties["employed"] = True
+                        worker.work = "생산"
+                        worker.space = employer.space
+                        results.append("→ 협상 성공!\n")
+                        break
+                    else:
+                        results.append("→ 협상 실패, 재시도...\n")
+
+            world.update()
+            time.sleep(0.2)
 
         results.append("\n모든 시뮬레이션이 완료되었습니다!\n")
         results.append("-" * 40 + "\n")
@@ -171,18 +206,143 @@ def run_simulation(
     return "".join(results)
 
 
-# Gradio 인터페이스 생성
+def plot_simulation_results(
+    profits_per_simulation: List[float], average_wages: List[float]
+) -> str:
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 8))
+
+    ax1.plot(
+        range(1, len(profits_per_simulation) + 1), profits_per_simulation, marker="o"
+    )
+    ax1.set_title("Total Profit per Simulation")
+    ax1.set_xlabel("Simulation Number")
+    ax1.set_ylabel("Total Profit (₩)")
+    ax1.grid(True)
+
+    ax2.plot(
+        range(1, len(average_wages) + 1), average_wages, marker="x", color="orange"
+    )
+    ax2.set_title("Average Wage per Simulation")
+    ax2.set_xlabel("Simulation Number")
+    ax2.set_ylabel("Average Wage (₩)")
+    ax2.grid(True)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    image_base64 = base64.b64encode(buf.read()).decode("utf-8")
+    buf.close()
+    plt.close(fig)
+    return f"<img src='data:image/png;base64,{image_base64}'/>"
+
+
+def run_simulation_with_plot(
+    market_competition: float,
+    initial_wage: float,
+    sim_count: int,
+    initial_population: int,
+    worker_count: int,
+) -> tuple[str, str]:
+    results = ["Initializing simulation environment...\n"]
+    total_profits = []
+    average_wages = []
+
+    try:
+        world = World()
+        world.population = initial_population
+
+        env1 = Environment(
+            "market", {"demand": 1000, "supply": 800, "competition": market_competition}
+        )
+        env2 = Environment(
+            "secondary", {"demand": 900, "supply": 850, "competition": 0.3}
+        )
+        world.add_environment(env1)
+        world.add_environment(env2)
+
+        for i in range(sim_count):
+            results.append(f"\nSimulation {i+1} Start:\n")
+            sim_profit = 0
+            wage_sum = 0
+            wage_count = 0
+
+            workers = [
+                Worker(
+                    f"worker{j+1}",
+                    age=20 + j,
+                    distance=1.0 + j,
+                    previous_wage=initial_wage,
+                )
+                for j in range(worker_count)
+            ]
+            employer = Employer("employer1", property_size=1000)
+            world.add_actor(employer)
+            for worker in workers:
+                world.add_actor(worker)
+
+            env1.manifest("competition_rise", target=env2)
+
+            for worker in workers:
+                for attempt in range(worker.max_attempts):
+                    wage = worker.negotiate_wage(world.population)
+                    optimal_workers = employer.calculate_optimal_employment(wage)
+                    profit = employer.calculate_profit(wage, optimal_workers)
+
+                    results.append(f"{worker.id} Negotiation Attempt {attempt + 1}:\n")
+                    results.append(f"- Proposed Wage: ₩{wage:,.0f}\n")
+                    results.append(f"- Optimal Number of Workers: {optimal_workers}\n")
+                    results.append(f"- Expected Profit: ₩{profit:,.0f}\n")
+
+                    if profit > 0:
+                        sim_profit += profit
+                        wage_sum += wage
+                        wage_count += 1
+                        employer.perform_action("negotiate", worker)
+                        worker.properties["employed"] = True
+                        worker.work = "production"
+                        worker.space = employer.space
+                        results.append("→ Negotiation Successful!\n")
+                        break
+                    else:
+                        results.append("→ Negotiation Failed, Retrying...\n")
+
+            world.update()
+            time.sleep(0.2)
+            total_profits.append(sim_profit)
+            avg_wage = wage_sum / wage_count if wage_count > 0 else 0
+            average_wages.append(avg_wage)
+
+        results.append("\nAll simulations completed successfully.\n")
+        results.append("-" * 40 + "\n")
+
+    except Exception as e:
+        results.append(f"Simulation error occurred: {str(e)}\n")
+
+    text_output = "".join(results)
+    img_output = plot_simulation_results(total_profits, average_wages)
+    return text_output, img_output
+
+
 iface = gr.Interface(
-    fn=run_simulation,
+    fn=run_simulation_with_plot,
     inputs=[
-        gr.Slider(minimum=0, maximum=1, step=0.1, label="시장 경쟁도", value=0.5),
-        gr.Number(label="초기 임금", value=3000000),
-        gr.Slider(minimum=1, maximum=10, step=1, label="시뮬레이션 횟수", value=5),
+        gr.Slider(
+            minimum=0, maximum=1, step=0.1, label="Market Competition", value=0.5
+        ),
+        gr.Number(label="Initial Wage", value=3000000),
+        gr.Number(label="Number of Simulations", value=5, precision=0),
+        gr.Number(label="Initial Population", value=1000, precision=0),
+        gr.Number(label="Number of Workers", value=3, precision=0),
     ],
-    outputs=gr.Textbox(label="시뮬레이션 결과", lines=10),
-    title="노동 시장 시뮬레이션",
-    description="시장 경쟁도와 초기 임금을 설정하여 노동 시장 시뮬레이션을 실행합니다.",
+    outputs=[
+        gr.Textbox(label="Simulation Results", lines=15),
+        gr.HTML(label="Simulation Graphs"),
+    ],
+    title="Labor Market Simulation (Extended + Visualization)",
+    description="Fully implemented PDF logic with multiple agents and graphical summary.",
+    allow_flagging="never",
 )
 
 if __name__ == "__main__":
-    iface.launch()
+    iface.launch(server_name="0.0.0.0", server_port=7860, share=True)
